@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"github.com/pdf-rag/internal/ai"
 	"github.com/pdf-rag/internal/rag"
 	"github.com/pdf-rag/internal/store"
+	"github.com/pdf-rag/internal/ui"
 )
 
 func main() {
@@ -102,6 +104,22 @@ func main() {
 			"answer":  answer.Text,
 			"sources": answer.Sources,
 		})
+	})
+
+	// Serve React SPA — must come after API routes
+	distFS, err := ui.FS()
+	if err != nil {
+		log.Fatalf("ui.FS: %v", err)
+	}
+	fileServer := http.FileServer(http.FS(distFS))
+	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
+		// Fall back to index.html for client-side routing
+		if req.URL.Path != "/" {
+			if _, err := distFS.(fs.StatFS).Stat(req.URL.Path[1:]); err != nil {
+				req.URL.Path = "/"
+			}
+		}
+		fileServer.ServeHTTP(w, req)
 	})
 
 	log.Printf("server listening on :%s", port)

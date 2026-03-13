@@ -3,3 +3,5 @@
 docs
 *.pdf
 bin
+
+web/node_modules
