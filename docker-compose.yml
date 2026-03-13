@@ -1,6 +1,23 @@
 version: "3.9"
 
 services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pdf-rag-api
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      PORT: 8080
+      DB_URL: postgres://rag:rag@postgres:5432/ragdb
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+
   postgres:
     image: pgvector/pgvector:pg16
     container_name: ragdb
@@ -17,6 +34,7 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    restart: unless-stopped
 
 volumes:
   pgdata:

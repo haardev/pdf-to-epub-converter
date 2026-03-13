@@ -9,7 +9,7 @@ import (
 	"strings"
 
 	"github.com/joho/godotenv"
-	"github.com/pdf-rag/internal/ollama"
+	"github.com/pdf-rag/internal/ai"
 	pdfpkg "github.com/pdf-rag/internal/pdf"
 	"github.com/pdf-rag/internal/store"
 )
@@ -24,10 +24,23 @@ func main() {
 	_ = godotenv.Load()
 
 	dbURL := getEnv("DB_URL", "postgres://rag:rag@localhost:5432/ragdb")
-	ollamaURL := getEnv("OLLAMA_URL", "http://localhost:11434")
-	embedModel := getEnv("EMBED_MODEL", "mxbai-embed-large")
-	genModel := getEnv("GEN_MODEL", "llama3")
-	chunkSize := getEnvInt("CHUNK_SIZE", 120)
+	aiClient, err := ai.New(ai.Config{
+		Provider:             getEnv("AI_PROVIDER", "ollama"),
+		OllamaURL:            getEnv("OLLAMA_URL", "http://localhost:11434"),
+		EmbedModel:           getEnv("EMBED_MODEL", "mxbai-embed-large"),
+		GenModel:             getEnv("GEN_MODEL", "llama3"),
+		EmbedDimensions:      getEnvInt("EMBED_DIM", 0),
+		AzureEndpoint:        getEnv("AZURE_AI_ENDPOINT", ""),
+		AzureAPIKey:          getEnv("AZURE_AI_API_KEY", ""),
+		AzureAPIVersion:      getEnv("AZURE_AI_API_VERSION", ""),
+		AzureEmbedDeployment: getEnv("AZURE_EMBED_DEPLOYMENT", ""),
+		AzureChatDeployment:  getEnv("AZURE_CHAT_DEPLOYMENT", ""),
+	})
+	if err != nil {
+		log.Fatalf("ai.New: %v", err)
+	}
+	embedDim := getEnvInt("EMBED_DIM", 0)
+	chunkSize := getEnvInt("CHUNK_SIZE", 90)
 	chunkOverlap := getEnvInt("CHUNK_OVERLAP", 24)
 
 	ctx := context.Background()
@@ -39,24 +52,30 @@ func main() {
 	}
 	defer db.Close()
 
-	ollamaClient := ollama.New(ollamaURL, embedModel, genModel)
-
 	log.Printf("extracting text from %s...", pdfPath)
-	text, err := pdfpkg.ExtractText(pdfPath)
+	pages, err := pdfpkg.ExtractPages(pdfPath)
 	if err != nil {
-		log.Fatalf("ExtractText: %v", err)
+		log.Fatalf("ExtractPages: %v", err)
 	}
-	log.Printf("extracted %d characters", len(text))
+	totalChars := 0
+	for _, page := range pages {
+		totalChars += len(page.Text)
+	}
+	log.Printf("extracted %d characters across %d pages", totalChars, len(pages))
 
-	chunks := pdfpkg.ChunkText(text, chunkSize, chunkOverlap)
+	chunks := pdfpkg.ChunkPages(pages, chunkSize, chunkOverlap)
 	log.Printf("produced %d chunks", len(chunks))
 
 	source := filepath.Base(pdfPath)
+	if err := db.DeleteSourceChunks(ctx, source); err != nil {
+		log.Fatalf("DeleteSourceChunks: %v", err)
+	}
+
 	storedChunks := 0
 
 	for i, chunk := range chunks {
-		log.Printf("processing chunk %d/%d...", i+1, len(chunks))
-		if err := ingestChunk(ctx, db, ollamaClient, source, chunk.Text, &storedChunks); err != nil {
+		log.Printf("processing chunk %d/%d (page %d)...", i+1, len(chunks), chunk.PageNumber)
+		if err := ingestChunk(ctx, db, aiClient, source, chunk, embedDim, &storedChunks); err != nil {
 			log.Fatalf("process chunk %d: %v", i, err)
 		}
 	}
@@ -64,26 +83,36 @@ func main() {
 	log.Printf("done — ingested %d chunks from %q", storedChunks, source)
 }
 
-func ingestChunk(ctx context.Context, db *store.DB, ollamaClient *ollama.Client, source, text string, chunkIndex *int) error {
-	vec, err := ollamaClient.Embed(text)
+func ingestChunk(ctx context.Context, db *store.DB, aiClient ai.Client, source string, chunk pdfpkg.Chunk, embedDim int, chunkIndex *int) error {
+	vec, err := aiClient.Embed(chunk.Text)
 	if err != nil {
 		if isContextLengthError(err) {
-			left, right, splitErr := splitTextInHalf(text)
+			left, right, splitErr := splitChunkInHalf(chunk)
 			if splitErr != nil {
 				return fmt.Errorf("chunk too long for embedding and could not be split further: %w", err)
 			}
 
 			log.Printf("chunk exceeded embedding context; splitting into smaller pieces")
-			if err := ingestChunk(ctx, db, ollamaClient, source, left, chunkIndex); err != nil {
+			if err := ingestChunk(ctx, db, aiClient, source, left, embedDim, chunkIndex); err != nil {
 				return err
 			}
-			return ingestChunk(ctx, db, ollamaClient, source, right, chunkIndex)
+			return ingestChunk(ctx, db, aiClient, source, right, embedDim, chunkIndex)
 		}
 
 		return fmt.Errorf("embed chunk %d: %w", *chunkIndex, err)
 	}
 
-	if err := db.UpsertChunk(ctx, source, text, *chunkIndex, vec); err != nil {
+	if *chunkIndex == 0 {
+		requiredDim := len(vec)
+		if embedDim > 0 {
+			requiredDim = embedDim
+		}
+		if err := db.EnsureEmbeddingDimensions(ctx, requiredDim); err != nil {
+			return err
+		}
+	}
+
+	if err := db.UpsertChunk(ctx, source, chunk.Text, *chunkIndex, chunk.PageNumber, chunk.SectionTitle, chunk.Captions, vec); err != nil {
 		return fmt.Errorf("upsert chunk %d: %w", *chunkIndex, err)
 	}
 
@@ -91,15 +120,17 @@ func ingestChunk(ctx context.Context, db *store.DB, ollamaClient *ollama.Client,
 	return nil
 }
 
-func splitTextInHalf(text string) (string, string, error) {
-	words := strings.Fields(text)
+func splitChunkInHalf(chunk pdfpkg.Chunk) (pdfpkg.Chunk, pdfpkg.Chunk, error) {
+	words := strings.Fields(chunk.Text)
 	if len(words) < 2 {
-		return "", "", fmt.Errorf("chunk contains fewer than 2 words")
+		return pdfpkg.Chunk{}, pdfpkg.Chunk{}, fmt.Errorf("chunk contains fewer than 2 words")
 	}
 
 	mid := len(words) / 2
-	left := strings.Join(words[:mid], " ")
-	right := strings.Join(words[mid:], " ")
+	left := chunk
+	right := chunk
+	left.Text = strings.Join(words[:mid], " ")
+	right.Text = strings.Join(words[mid:], " ")
 	return left, right, nil
 }
 

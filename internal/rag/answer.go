@@ -24,7 +24,7 @@ func (s *Searcher) Ask(ctx context.Context, question string, k int) (*Answer, er
 
 	prompt := buildPrompt(question, sources)
 
-	text, err := s.ollama.Generate(prompt)
+	text, err := s.ai.Generate(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("generate answer: %w", err)
 	}
@@ -34,16 +34,29 @@ func (s *Searcher) Ask(ctx context.Context, question string, k int) (*Answer, er
 
 func buildPrompt(question string, chunks []store.Result) string {
 	var sb strings.Builder
-	sb.WriteString("You are a helpful assistant. Answer the question below using ONLY the provided context.\n")
-	sb.WriteString("If the context does not contain enough information, say so honestly.\n\n")
+	sb.WriteString("You are a careful assistant answering questions about a PDF.\n")
+	sb.WriteString("Use ONLY the provided context.\n")
+	sb.WriteString("If the context is insufficient, say that clearly instead of guessing.\n")
+	sb.WriteString("Prefer precise answers grounded in the retrieved text.\n")
+	sb.WriteString("When relevant, mention page numbers and section titles.\n")
+	sb.WriteString("If figure information appears only in captions, say that explicitly.\n\n")
 	sb.WriteString("### Context\n\n")
 
 	for i, c := range chunks {
-		fmt.Fprintf(&sb, "[%d] (source: %s, chunk %d)\n%s\n\n", i+1, c.Source, c.ChunkIndex, c.Content)
+		fmt.Fprintf(&sb, "[%d] (source: %s, page: %d, chunk: %d", i+1, c.Source, c.PageNumber, c.ChunkIndex)
+		if c.SectionTitle != "" {
+			fmt.Fprintf(&sb, ", section: %s", c.SectionTitle)
+		}
+		sb.WriteString(")\n")
+		if len(c.Captions) > 0 {
+			fmt.Fprintf(&sb, "Captions: %s\n", strings.Join(c.Captions, " | "))
+		}
+		fmt.Fprintf(&sb, "%s\n\n", c.Content)
 	}
 
 	sb.WriteString("### Question\n\n")
 	sb.WriteString(question)
 	sb.WriteString("\n\n### Answer\n\n")
+	sb.WriteString("Answer in a grounded way and cite supporting pages inline, for example '(page 3)'.\n\n")
 	return sb.String()
 }

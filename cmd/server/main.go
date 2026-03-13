@@ -11,7 +11,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
-	"github.com/pdf-rag/internal/ollama"
+	"github.com/pdf-rag/internal/ai"
 	"github.com/pdf-rag/internal/rag"
 	"github.com/pdf-rag/internal/store"
 )
@@ -20,11 +20,24 @@ func main() {
 	_ = godotenv.Load()
 
 	dbURL := getEnv("DB_URL", "postgres://rag:rag@localhost:5432/ragdb")
-	ollamaURL := getEnv("OLLAMA_URL", "http://localhost:11434")
-	embedModel := getEnv("EMBED_MODEL", "mxbai-embed-large")
-	genModel := getEnv("GEN_MODEL", "llama3")
 	topK := getEnvInt("TOP_K", 5)
 	port := getEnv("PORT", "8080")
+
+	aiClient, err := ai.New(ai.Config{
+		Provider:             getEnv("AI_PROVIDER", "ollama"),
+		OllamaURL:            getEnv("OLLAMA_URL", "http://localhost:11434"),
+		EmbedModel:           getEnv("EMBED_MODEL", "mxbai-embed-large"),
+		GenModel:             getEnv("GEN_MODEL", "llama3"),
+		EmbedDimensions:      getEnvInt("EMBED_DIM", 0),
+		AzureEndpoint:        getEnv("AZURE_AI_ENDPOINT", ""),
+		AzureAPIKey:          getEnv("AZURE_AI_API_KEY", ""),
+		AzureAPIVersion:      getEnv("AZURE_AI_API_VERSION", ""),
+		AzureEmbedDeployment: getEnv("AZURE_EMBED_DEPLOYMENT", ""),
+		AzureChatDeployment:  getEnv("AZURE_CHAT_DEPLOYMENT", ""),
+	})
+	if err != nil {
+		log.Fatalf("ai.New: %v", err)
+	}
 
 	ctx := context.Background()
 
@@ -35,8 +48,7 @@ func main() {
 	}
 	defer db.Close()
 
-	ollamaClient := ollama.New(ollamaURL, embedModel, genModel)
-	searcher := rag.NewSearcher(ollamaClient, db)
+	searcher := rag.NewSearcher(aiClient, db)
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)

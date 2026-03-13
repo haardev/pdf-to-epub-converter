@@ -3,30 +3,48 @@ package store
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/pgvector/pgvector-go"
 )
 
 // Result holds a retrieved document chunk and its similarity score.
 type Result struct {
-	ID         int
-	Source     string
-	ChunkIndex int
-	Content    string
-	Score      float64
+	ID           int      `json:"id"`
+	Source       string   `json:"source"`
+	ChunkIndex   int      `json:"chunk_index"`
+	PageNumber   int      `json:"page_number"`
+	SectionTitle string   `json:"section_title"`
+	Captions     []string `json:"captions"`
+	Content      string   `json:"content"`
+	Score        float64  `json:"score"`
 }
 
 // UpsertChunk inserts a new document chunk with its embedding.
 // Duplicate (source, chunk_index) pairs are replaced.
-func (db *DB) UpsertChunk(ctx context.Context, source, content string, idx int, embedding []float32) error {
+func (db *DB) UpsertChunk(ctx context.Context, source, content string, idx int, pageNumber int, sectionTitle string, captions []string, embedding []float32) error {
 	const q = `
-INSERT INTO documents (source, chunk_index, content, embedding)
-VALUES ($1, $2, $3, $4)
+INSERT INTO documents (source, chunk_index, page_number, section_title, captions, content, embedding)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 ON CONFLICT (source, chunk_index)
-DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding`
+DO UPDATE SET
+    page_number = EXCLUDED.page_number,
+    section_title = EXCLUDED.section_title,
+    captions = EXCLUDED.captions,
+    content = EXCLUDED.content,
+    embedding = EXCLUDED.embedding`
 
-	if _, err := db.Pool.Exec(ctx, q, source, idx, content, pgvector.NewVector(embedding)); err != nil {
+	if _, err := db.Pool.Exec(ctx, q, source, idx, pageNumber, sectionTitle, strings.Join(captions, "\n"), content, pgvector.NewVector(embedding)); err != nil {
 		return fmt.Errorf("upsert chunk: %w", err)
+	}
+	return nil
+}
+
+// DeleteSourceChunks removes all chunks for a specific source so re-ingestion
+// with new chunking logic does not leave stale records behind.
+func (db *DB) DeleteSourceChunks(ctx context.Context, source string) error {
+	if _, err := db.Pool.Exec(ctx, `DELETE FROM documents WHERE source = $1`, source); err != nil {
+		return fmt.Errorf("delete source chunks: %w", err)
 	}
 	return nil
 }
@@ -35,7 +53,7 @@ DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding`
 // cosine distance (operator <=>).
 func (db *DB) SearchSimilar(ctx context.Context, embedding []float32, k int) ([]Result, error) {
 	const q = `
-SELECT id, source, chunk_index, content,
+SELECT id, source, chunk_index, page_number, section_title, captions, content,
        1 - (embedding <=> $1) AS score
 FROM   documents
 ORDER  BY embedding <=> $1
@@ -50,8 +68,12 @@ LIMIT  $2`
 	var results []Result
 	for rows.Next() {
 		var r Result
-		if err := rows.Scan(&r.ID, &r.Source, &r.ChunkIndex, &r.Content, &r.Score); err != nil {
+		var captions string
+		if err := rows.Scan(&r.ID, &r.Source, &r.ChunkIndex, &r.PageNumber, &r.SectionTitle, &captions, &r.Content, &r.Score); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
+		}
+		if captions != "" {
+			r.Captions = strings.Split(captions, "\n")
 		}
 		results = append(results, r)
 	}
