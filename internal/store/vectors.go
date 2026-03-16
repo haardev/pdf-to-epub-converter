@@ -51,15 +51,23 @@ func (db *DB) DeleteSourceChunks(ctx context.Context, source string) error {
 
 // SearchSimilar returns the k most similar chunks to the given embedding using
 // cosine distance (operator <=>).
-func (db *DB) SearchSimilar(ctx context.Context, embedding []float32, k int) ([]Result, error) {
-	const q = `
+func (db *DB) SearchSimilar(ctx context.Context, embedding []float32, k int, source string) ([]Result, error) {
+	q := `
 SELECT id, source, chunk_index, page_number, section_title, captions, content,
        1 - (embedding <=> $1) AS score
-FROM   documents
-ORDER  BY embedding <=> $1
-LIMIT  $2`
+FROM   documents`
+	args := []any{pgvector.NewVector(embedding)}
+	if strings.TrimSpace(source) != "" {
+		q += ` WHERE source = $2`
+		args = append(args, source)
+		q += ` ORDER BY embedding <=> $1 LIMIT $3`
+		args = append(args, k)
+	} else {
+		q += ` ORDER BY embedding <=> $1 LIMIT $2`
+		args = append(args, k)
+	}
 
-	rows, err := db.Pool.Query(ctx, q, pgvector.NewVector(embedding), k)
+	rows, err := db.Pool.Query(ctx, q, args...)
 	if err != nil {
 		return nil, fmt.Errorf("similarity search: %w", err)
 	}
@@ -78,4 +86,23 @@ LIMIT  $2`
 		results = append(results, r)
 	}
 	return results, rows.Err()
+}
+
+func (db *DB) ListSources(ctx context.Context) ([]string, error) {
+	rows, err := db.Pool.Query(ctx, `SELECT DISTINCT source FROM documents ORDER BY source`)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
+	defer rows.Close()
+
+	var sources []string
+	for rows.Next() {
+		var source string
+		if err := rows.Scan(&source); err != nil {
+			return nil, fmt.Errorf("scan source: %w", err)
+		}
+		sources = append(sources, source)
+	}
+
+	return sources, rows.Err()
 }

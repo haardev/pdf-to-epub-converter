@@ -16,11 +16,27 @@ interface Source {
   score: number
 }
 
+interface Assessment {
+  risk_level: 'low' | 'medium' | 'high'
+  impact_level: 'low' | 'medium' | 'high'
+  evidence_level: 'weak' | 'moderate' | 'strong'
+  risk_score: number
+  confidence_score: number
+  summary: string
+  reasons: string[]
+}
+
 interface AnswerCardData {
   id: string
   question: string
   answer: string
   sources: Source[]
+  assessment?: Assessment
+}
+
+interface CitationTarget {
+  source: string
+  page_number: number
 }
 
 function SourceCard({
@@ -58,6 +74,79 @@ function SourceCard({
 
 function buildDocumentURL(source: string) {
   return `/documents?source=${encodeURIComponent(source)}`
+}
+
+function uniqueSources(sources: Source[]) {
+  return Array.from(new Set(sources.map((source) => source.source)))
+}
+
+function normalizeCitationSource(source: string) {
+  return source.trim().toLowerCase()
+}
+
+function isPlaceholderCitationSource(source: string) {
+  const normalized = normalizeCitationSource(source)
+  return normalized === '' || normalized === 'source.pdf' || normalized === 'policy.pdf' || normalized === 'document.pdf'
+}
+
+function resolveCitationTarget(target: CitationTarget, sources: Source[]): CitationTarget | null {
+  const trimmedSource = target.source.trim()
+
+  if (!trimmedSource || isPlaceholderCitationSource(trimmedSource)) {
+    const pageMatches = sources.filter((source) => source.page_number === target.page_number)
+    if (pageMatches.length === 1) {
+      return { source: pageMatches[0].source, page_number: pageMatches[0].page_number }
+    }
+    if (pageMatches.length > 1) {
+      return { source: pageMatches[0].source, page_number: pageMatches[0].page_number }
+    }
+    if (sources.length === 1) {
+      return { source: sources[0].source, page_number: target.page_number || sources[0].page_number }
+    }
+    return null
+  }
+
+  const normalizedTarget = normalizeCitationSource(trimmedSource)
+  const exactMatch = sources.find((source) => normalizeCitationSource(source.source) === normalizedTarget)
+  if (exactMatch) {
+    return { source: exactMatch.source, page_number: target.page_number || exactMatch.page_number }
+  }
+
+  const looseMatch = sources.find((source) => {
+    const normalizedSource = normalizeCitationSource(source.source)
+    return normalizedSource.includes(normalizedTarget) || normalizedTarget.includes(normalizedSource)
+  })
+  if (looseMatch) {
+    return { source: looseMatch.source, page_number: target.page_number || looseMatch.page_number }
+  }
+
+  const pageMatches = sources.filter((source) => source.page_number === target.page_number)
+  if (pageMatches.length > 0) {
+    return { source: pageMatches[0].source, page_number: pageMatches[0].page_number }
+  }
+
+  if (sources.length === 1) {
+    return { source: sources[0].source, page_number: target.page_number || sources[0].page_number }
+  }
+
+  return null
+}
+
+function createCitationMarkdown(answer: string) {
+  const sourceAware = answer.replace(
+    /\(((?:source:\s*)?[^()\n]+?),\s*page\s+(\d+)\)/gi,
+    (_, rawSource: string, rawPage: string) => {
+      const source = rawSource.replace(/^source:\s*/i, '').trim()
+      const page = rawPage.trim()
+      const href = `#cite:${encodeURIComponent(source)}:${page}`
+      return `[(${source}, page ${page})](${href})`
+    },
+  )
+
+  return sourceAware.replace(/\(page\s+(\d+)\)/gi, (_, rawPage: string) => {
+    const page = rawPage.trim()
+    return `[(page ${page})](#cite::${page})`
+  })
 }
 
 function PDFViewerModal({
@@ -177,15 +266,108 @@ function PDFViewerModal({
   return createPortal(modal, document.body)
 }
 
+function AssessmentCard({ assessment }: { assessment: Assessment }) {
+  const [expanded, setExpanded] = useState(false)
+  const riskLabel =
+    assessment.risk_level === 'high'
+      ? 'High-impact answer'
+      : assessment.risk_level === 'medium'
+        ? 'Review carefully'
+        : 'Lower caution'
+
+  const disclosureTitle =
+    assessment.risk_level === 'high'
+      ? 'verify this before relying on it'
+      : assessment.risk_level === 'medium'
+        ? 'a quick policy verification is recommended'
+        : 'lower caution details'
+
+  const evidenceLabel =
+    assessment.evidence_level === 'strong'
+      ? 'Strong evidence'
+      : assessment.evidence_level === 'moderate'
+        ? 'Moderate evidence'
+        : 'Weak evidence'
+
+  const impactLabel =
+    assessment.impact_level === 'high'
+      ? 'High user impact'
+      : assessment.impact_level === 'medium'
+        ? 'Medium user impact'
+        : 'Lower user impact'
+
+  return (
+    <section className={`assessment-card assessment-card--${assessment.risk_level}`} aria-label="Answer risk assessment">
+      <button
+        className="assessment-toggle"
+        type="button"
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+      >
+        <div className="assessment-header">
+          <div>
+            <p className="assessment-kicker">Answer risk signal</p>
+            <h3>{impactLabel}</h3>
+            <p className="assessment-title-note">{disclosureTitle}</p>
+          </div>
+          <div className="assessment-header-right">
+            <div className="assessment-badges">
+              <span className={`assessment-badge assessment-badge--${assessment.risk_level}`}>{riskLabel}</span>
+              <span className="assessment-badge assessment-badge--neutral">{evidenceLabel}</span>
+            </div>
+            <span className="assessment-toggle-icon" aria-hidden="true">
+              {expanded ? '−' : '+'}
+            </span>
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div className="assessment-content">
+          <p className="assessment-summary">{assessment.summary}</p>
+
+          <div className="assessment-metrics">
+            <div className="assessment-metric">
+              <div className="assessment-metric-top">
+                <span>Risk if relied on blindly</span>
+                <strong>{assessment.risk_score}%</strong>
+              </div>
+              <div className="assessment-meter" aria-hidden="true">
+                <span className={`assessment-meter-fill assessment-meter-fill--${assessment.risk_level}`} style={{ width: `${assessment.risk_score}%` }} />
+              </div>
+            </div>
+
+            <div className="assessment-metric">
+              <div className="assessment-metric-top">
+                <span>Evidence confidence</span>
+                <strong>{assessment.confidence_score}%</strong>
+              </div>
+              <div className="assessment-meter" aria-hidden="true">
+                <span className="assessment-meter-fill assessment-meter-fill--confidence" style={{ width: `${assessment.confidence_score}%` }} />
+              </div>
+            </div>
+          </div>
+
+          {assessment.reasons.length > 0 && (
+            <ul className="assessment-reasons">
+              {assessment.reasons.map((reason) => (
+                <li key={reason}>{reason}</li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+    </section>
+  )
+}
+
 function AnswerCard({ card }: { card: AnswerCardData }) {
   const [showSources, setShowSources] = useState(false)
   const [expandedSourceId, setExpandedSourceId] = useState<number | null>(null)
-  const [viewerSource, setViewerSource] = useState<Source | null>(null)
+  const [viewerSource, setViewerSource] = useState<CitationTarget | null>(null)
+  const policySources = useMemo(() => uniqueSources(card.sources), [card.sources])
 
-  const answerWithLinks = useMemo(
-    () => card.answer.replace(/\(page\s+(\d+)\)/gi, '[(page $1)](#page-$1)'),
-    [card.answer],
-  )
+  const answerWithLinks = useMemo(() => createCitationMarkdown(card.answer), [card.answer])
 
   function toggleSources() {
     setShowSources((current) => {
@@ -196,10 +378,10 @@ function AnswerCard({ card }: { card: AnswerCardData }) {
     })
   }
 
-  function handleCitationClick(pageNumber: number) {
-    const matchingSource = card.sources.find((source) => source.page_number === pageNumber)
-    if (!matchingSource) return
-    setViewerSource(matchingSource)
+  function handleCitationClick(target: CitationTarget) {
+    const resolvedTarget = resolveCitationTarget(target, card.sources)
+    if (!resolvedTarget) return
+    setViewerSource(resolvedTarget)
   }
 
   return (
@@ -208,15 +390,33 @@ function AnswerCard({ card }: { card: AnswerCardData }) {
         <h2>{card.question}</h2>
         <p className="answer-card-kicker">✦ Smart search results</p>
 
+        {policySources.length > 0 && (
+          <div className="policy-source-list" aria-label="Policies referenced">
+            {policySources.map((source) => (
+              <span key={source} className="policy-source-pill">
+                {source}
+              </span>
+            ))}
+          </div>
+        )}
+
         <div className="answer-markdown">
           <ReactMarkdown
             components={{
               a: ({ href, children }) => {
-                if (href?.startsWith('#page-')) {
-                  const pageNumber = Number(href.replace('#page-', ''))
+                if (href?.startsWith('#cite:')) {
+                  const payload = href.replace('#cite:', '')
+                  const parts = payload.split(':')
+                  const pageNumber = Number(parts[parts.length - 1] ?? '0')
+                  const encodedSource = parts.slice(0, -1).join(':')
+                  const source = encodedSource ? decodeURIComponent(encodedSource) : ''
 
                   return (
-                    <button className="citation-link" type="button" onClick={() => handleCitationClick(pageNumber)}>
+                    <button
+                      className="citation-link"
+                      type="button"
+                      onClick={() => handleCitationClick({ source, page_number: pageNumber })}
+                    >
                       {children}
                     </button>
                   )
@@ -250,13 +450,20 @@ function AnswerCard({ card }: { card: AnswerCardData }) {
                     onToggle={() =>
                       setExpandedSourceId((current) => (current === source.id ? null : source.id))
                     }
-                    onOpenPdf={(selectedSource) => setViewerSource(selectedSource)}
+                    onOpenPdf={(selectedSource) =>
+                      setViewerSource({
+                        source: selectedSource.source,
+                        page_number: selectedSource.page_number,
+                      })
+                    }
                   />
                 ))}
               </div>
             )}
           </div>
         )}
+
+        {card.assessment && <AssessmentCard assessment={card.assessment} />}
       </article>
 
       {viewerSource && (
@@ -274,6 +481,8 @@ export default function App() {
   const [currentCard, setCurrentCard] = useState<AnswerCardData | null>(null)
   const [activeQuestion, setActiveQuestion] = useState('')
   const [input, setInput] = useState('')
+  const [selectedSource, setSelectedSource] = useState('')
+  const [availableSources, setAvailableSources] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -293,6 +502,34 @@ export default function App() {
     setInput('')
   }
 
+  useEffect(() => {
+    let cancelled = false
+
+    async function loadSources() {
+      try {
+        const res = await fetch('/sources')
+        if (!res.ok) {
+          throw new Error(`Request failed: ${res.status}`)
+        }
+
+        const data = await res.json()
+        if (!cancelled) {
+          setAvailableSources(data.sources ?? [])
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : 'Failed to load sources')
+        }
+      }
+    }
+
+    void loadSources()
+
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
   async function submitQuestion(rawQuestion?: string) {
     const question = (rawQuestion ?? input).trim()
     if (!question || loading) return
@@ -307,7 +544,7 @@ export default function App() {
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, source: selectedSource || undefined }),
       })
 
       if (!res.ok) {
@@ -321,6 +558,7 @@ export default function App() {
         question,
         answer: data.answer,
         sources: data.sources ?? [],
+        assessment: data.assessment,
       })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
@@ -347,24 +585,43 @@ export default function App() {
       <main className="app-shell">
         <section className="phone-frame">
           <form className="search-form" onSubmit={handleSubmit}>
-            <div className="search-input-wrap">
-              <span className="search-icon" aria-hidden="true">
-                ✦
-              </span>
-              <textarea
-                className="search-input"
-                rows={1}
-                value={input}
-                onChange={(event) => setInput(event.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Ask anything about travel..."
+            <label className="source-select-wrap">
+              <span className="source-select-label">Policy</span>
+              <select
+                className="source-select"
+                value={selectedSource}
+                onChange={(event) => setSelectedSource(event.target.value)}
                 disabled={loading}
-                autoFocus
-              />
+              >
+                <option value="">All policies</option>
+                {availableSources.map((source) => (
+                  <option key={source} value={source}>
+                    {source}
+                  </option>
+                ))}
+              </select>
+            </label>
+
+            <div className="search-row">
+              <div className="search-input-wrap">
+                <span className="search-icon" aria-hidden="true">
+                  ✦
+                </span>
+                <textarea
+                  className="search-input"
+                  rows={1}
+                  value={input}
+                  onChange={(event) => setInput(event.target.value)}
+                  onKeyDown={handleKeyDown}
+                  placeholder="Ask anything about travel..."
+                  disabled={loading}
+                  autoFocus
+                />
+              </div>
+              <button className="search-button" type="submit" disabled={loading || !input.trim()}>
+                Ask
+              </button>
             </div>
-            <button className="search-button" type="submit" disabled={loading || !input.trim()}>
-              Ask
-            </button>
           </form>
 
           {(currentCard || loading || error) && (

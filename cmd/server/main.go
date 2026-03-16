@@ -63,6 +63,16 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 
+	r.Get("/sources", func(w http.ResponseWriter, req *http.Request) {
+		sources, err := db.ListSources(req.Context())
+		if err != nil {
+			log.Printf("sources error: %v", err)
+			http.Error(w, `{"error":"sources failed"}`, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"sources": sources})
+	})
+
 	// GET /search?q=<query>&k=5
 	r.Get("/search", func(w http.ResponseWriter, req *http.Request) {
 		q := req.URL.Query().Get("q")
@@ -76,8 +86,9 @@ func main() {
 				k = parsed
 			}
 		}
+		source := strings.TrimSpace(req.URL.Query().Get("source"))
 
-		results, err := searcher.Search(req.Context(), q, k)
+		results, err := searcher.SearchWithSource(req.Context(), q, k, source)
 		if err != nil {
 			log.Printf("search error: %v", err)
 			http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
@@ -90,13 +101,14 @@ func main() {
 	r.Post("/chat", func(w http.ResponseWriter, req *http.Request) {
 		var body struct {
 			Question string `json:"question"`
+			Source   string `json:"source"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Question == "" {
 			http.Error(w, `{"error":"question is required"}`, http.StatusBadRequest)
 			return
 		}
 
-		answer, err := searcher.Ask(req.Context(), body.Question, topK)
+		answer, err := searcher.AskWithSource(req.Context(), body.Question, topK, strings.TrimSpace(body.Source))
 		if err != nil {
 			log.Printf("chat error: %v", err)
 			http.Error(w, `{"error":"chat failed"}`, http.StatusInternalServerError)
@@ -104,8 +116,9 @@ func main() {
 		}
 
 		writeJSON(w, http.StatusOK, map[string]any{
-			"answer":  answer.Text,
-			"sources": answer.Sources,
+			"answer":     answer.Text,
+			"sources":    answer.Sources,
+			"assessment": answer.Assessment,
 		})
 	})
 
