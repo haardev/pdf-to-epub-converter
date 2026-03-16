@@ -24,7 +24,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -o /out/app ${APP_PATH}
 FROM gcr.io/distroless/static-debian12
 
 WORKDIR /app
+ENV DOCS_DIR=/app/documents
 COPY --from=builder /out/app /app/app
+COPY --from=builder /src/*.pdf /app/documents/
 
 EXPOSE 8080
 

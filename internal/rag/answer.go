@@ -34,29 +34,34 @@ func (s *Searcher) Ask(ctx context.Context, question string, k int) (*Answer, er
 
 func buildPrompt(question string, chunks []store.Result) string {
 	var sb strings.Builder
-	sb.WriteString("You are a careful assistant answering questions about a PDF.\n")
-	sb.WriteString("Use ONLY the provided context.\n")
-	sb.WriteString("If the context is insufficient, say that clearly instead of guessing.\n")
-	sb.WriteString("Prefer precise answers grounded in the retrieved text.\n")
-	sb.WriteString("When relevant, mention page numbers and section titles.\n")
-	sb.WriteString("If figure information appears only in captions, say that explicitly.\n\n")
-	sb.WriteString("### Context\n\n")
 
+	sb.WriteString("You are a helpful assistant that answers questions about insurance policy documents.\n")
+	sb.WriteString("Answer ONLY using the context provided below. Do not guess or make up information.\n")
+	sb.WriteString("If the context does not contain enough information to answer, say so clearly.\n\n")
+
+	sb.WriteString("## Formatting rules\n")
+	sb.WriteString("- Write in clear, plain English that anyone can understand — avoid jargon.\n")
+	sb.WriteString("- Start with a direct one-sentence answer (yes/no when applicable).\n")
+	sb.WriteString("- Use bullet points for lists of conditions, exclusions, or requirements.\n")
+	sb.WriteString("- Use **bold** to highlight key terms, amounts, and important limits.\n")
+	sb.WriteString("- Cite the page number inline where the information comes from, e.g. (page 5).\n")
+	sb.WriteString("- End with a short summary or any important caveats to be aware of.\n\n")
+
+	sb.WriteString("## Context from the document\n\n")
 	for i, c := range chunks {
-		fmt.Fprintf(&sb, "[%d] (source: %s, page: %d, chunk: %d", i+1, c.Source, c.PageNumber, c.ChunkIndex)
+		fmt.Fprintf(&sb, "### Excerpt %d — %s, page %d", i+1, c.Source, c.PageNumber)
 		if c.SectionTitle != "" {
-			fmt.Fprintf(&sb, ", section: %s", c.SectionTitle)
+			fmt.Fprintf(&sb, " (%s)", c.SectionTitle)
 		}
-		sb.WriteString(")\n")
+		sb.WriteString("\n")
 		if len(c.Captions) > 0 {
-			fmt.Fprintf(&sb, "Captions: %s\n", strings.Join(c.Captions, " | "))
+			fmt.Fprintf(&sb, "_Captions: %s_\n", strings.Join(c.Captions, " | "))
 		}
 		fmt.Fprintf(&sb, "%s\n\n", c.Content)
 	}
 
-	sb.WriteString("### Question\n\n")
+	sb.WriteString("## Question\n\n")
 	sb.WriteString(question)
-	sb.WriteString("\n\n### Answer\n\n")
-	sb.WriteString("Answer in a grounded way and cite supporting pages inline, for example '(page 3)'.\n\n")
+	sb.WriteString("\n\n## Answer\n\n")
 	return sb.String()
 }

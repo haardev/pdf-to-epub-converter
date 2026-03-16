@@ -7,7 +7,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -22,6 +24,7 @@ func main() {
 	_ = godotenv.Load()
 
 	dbURL := getEnv("DB_URL", "postgres://rag:rag@localhost:5432/ragdb")
+	docsDir := getEnv("DOCS_DIR", ".")
 	topK := getEnvInt("TOP_K", 5)
 	port := getEnv("PORT", "8080")
 
@@ -106,6 +109,23 @@ func main() {
 		})
 	})
 
+	r.Get("/documents", func(w http.ResponseWriter, req *http.Request) {
+		source := strings.TrimSpace(req.URL.Query().Get("source"))
+		if source == "" {
+			http.Error(w, `{"error":"source is required"}`, http.StatusBadRequest)
+			return
+		}
+
+		documentPath, err := resolveDocumentPath(docsDir, source)
+		if err != nil {
+			http.Error(w, `{"error":"document not found"}`, http.StatusNotFound)
+			return
+		}
+
+		w.Header().Set("Content-Type", "application/pdf")
+		http.ServeFile(w, req, documentPath)
+	})
+
 	// Serve React SPA — must come after API routes
 	distFS, err := ui.FS()
 	if err != nil {
@@ -113,11 +133,13 @@ func main() {
 	}
 	fileServer := http.FileServer(http.FS(distFS))
 	r.Get("/*", func(w http.ResponseWriter, req *http.Request) {
-		// Fall back to index.html for client-side routing
-		if req.URL.Path != "/" {
-			if _, err := distFS.(fs.StatFS).Stat(req.URL.Path[1:]); err != nil {
-				req.URL.Path = "/"
-			}
+		// Strip leading slash and fall back to index.html for unknown paths (SPA routing)
+		fsPath := strings.TrimPrefix(req.URL.Path, "/")
+		if fsPath == "" {
+			fsPath = "."
+		}
+		if _, err := fs.Stat(distFS, fsPath); err != nil {
+			req.URL.Path = "/"
 		}
 		fileServer.ServeHTTP(w, req)
 	})
@@ -148,4 +170,24 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func resolveDocumentPath(docsDir, source string) (string, error) {
+	cleaned := filepath.Clean(source)
+	if cleaned == "." || filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "..") {
+		return "", os.ErrNotExist
+	}
+
+	candidates := []string{
+		filepath.Join(docsDir, cleaned),
+		filepath.Join(docsDir, filepath.Base(cleaned)),
+	}
+	for _, candidate := range candidates {
+		info, err := os.Stat(candidate)
+		if err == nil && !info.IsDir() {
+			return candidate, nil
+		}
+	}
+
+	return "", os.ErrNotExist
 }

@@ -3,6 +3,7 @@ package rag
 import (
 	"context"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 
@@ -14,6 +15,14 @@ import (
 type Searcher struct {
 	ai ai.Client
 	db *store.DB
+}
+
+type scoredResult struct {
+	result        store.Result
+	score         float64
+	tokens        map[string]struct{}
+	matchedTokens int
+	coverage      float64
 }
 
 // NewSearcher creates a Searcher.
@@ -28,10 +37,7 @@ func (s *Searcher) Search(ctx context.Context, query string, k int) ([]store.Res
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 
-	recallSize := k * 4
-	if recallSize < k {
-		recallSize = k
-	}
+	recallSize := maxInt(k*5, 20)
 
 	results, err := s.db.SearchSimilar(ctx, vec, recallSize)
 	if err != nil {
@@ -46,10 +52,8 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 	if len(results) == 0 {
 		return results
 	}
-
-	type scoredResult struct {
-		result store.Result
-		score  float64
+	if k <= 0 {
+		k = 1
 	}
 
 	scored := make([]scoredResult, 0, len(results))
@@ -58,10 +62,24 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 		titleTokens := tokenize(result.SectionTitle)
 		captionTokens := tokenize(strings.Join(result.Captions, " "))
 		contentTokens := tokenize(result.Content)
+		sourceTokens := tokenize(result.Source)
+		allTokens := mergeTokenSets(titleTokens, captionTokens, contentTokens, sourceTokens)
+		matchedTokens := sharedTokenCount(queryTokens, allTokens)
+		coverage := 0.0
+		if len(queryTokens) > 0 {
+			coverage = float64(matchedTokens) / float64(len(queryTokens))
+		}
 
 		score += float64(sharedTokenCount(queryTokens, contentTokens)) * 0.02
 		score += float64(sharedTokenCount(queryTokens, titleTokens)) * 0.08
 		score += float64(sharedTokenCount(queryTokens, captionTokens)) * 0.05
+		score += float64(sharedTokenCount(queryTokens, sourceTokens)) * 0.03
+		score += coverage * 0.12
+		if matchedTokens == 0 {
+			score -= 0.12
+		} else if matchedTokens == 1 && len(queryTokens) >= 4 {
+			score -= 0.04
+		}
 
 		if result.SectionTitle != "" {
 			score += 0.01
@@ -70,20 +88,32 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 			score += 0.01
 		}
 
-		scored = append(scored, scoredResult{result: result, score: score})
+		scored = append(scored, scoredResult{
+			result:        result,
+			score:         score,
+			tokens:        allTokens,
+			matchedTokens: matchedTokens,
+			coverage:      coverage,
+		})
 	}
 
 	sort.SliceStable(scored, func(i, j int) bool {
 		return scored[i].score > scored[j].score
 	})
 
-	limit := k
-	if limit > len(scored) {
-		limit = len(scored)
+	filtered := filterRelevantResults(scored, k)
+	if len(filtered) == 0 {
+		filtered = scored[:minInt(len(scored), k)]
 	}
 
-	reranked := make([]store.Result, 0, limit)
-	for _, item := range scored[:limit] {
+	limit := dynamicResultLimit(filtered, k)
+	selected := selectDiverseResults(filtered, limit)
+	sort.SliceStable(selected, func(i, j int) bool {
+		return selected[i].score > selected[j].score
+	})
+
+	reranked := make([]store.Result, 0, len(selected))
+	for _, item := range selected {
 		item.result.Score = item.score
 		reranked = append(reranked, item.result)
 	}
@@ -115,4 +145,142 @@ func sharedTokenCount(a, b map[string]struct{}) int {
 		}
 	}
 	return count
+}
+
+func mergeTokenSets(sets ...map[string]struct{}) map[string]struct{} {
+	merged := make(map[string]struct{})
+	for _, set := range sets {
+		for token := range set {
+			merged[token] = struct{}{}
+		}
+	}
+	return merged
+}
+
+func filterRelevantResults(scored []scoredResult, desiredK int) []scoredResult {
+	if len(scored) == 0 {
+		return nil
+	}
+
+	topScore := scored[0].score
+	relativeFloor := math.Max(topScore*0.93, topScore-0.07)
+	minKeep := minInt(len(scored), maxInt(2, minInt(3, desiredK/4+1)))
+
+	filtered := make([]scoredResult, 0, len(scored))
+	for i, item := range scored {
+		if i < minKeep || (item.score >= relativeFloor && (item.matchedTokens > 0 || item.coverage >= 0.4)) {
+			filtered = append(filtered, item)
+		}
+	}
+	return filtered
+}
+
+func dynamicResultLimit(scored []scoredResult, desiredK int) int {
+	if len(scored) == 0 {
+		return 0
+	}
+
+	maxLimit := minInt(len(scored), desiredK)
+	if maxLimit == 0 {
+		return 0
+	}
+
+	limit := minInt(maxLimit, 3)
+	topScore := scored[0].score
+	for limit < maxLimit {
+		next := scored[limit]
+		if next.score >= topScore*0.96 || scored[limit-1].score-next.score <= 0.02 {
+			limit++
+			continue
+		}
+		break
+	}
+
+	return maxInt(1, limit)
+}
+
+func selectDiverseResults(candidates []scoredResult, limit int) []scoredResult {
+	if limit <= 0 || len(candidates) == 0 {
+		return nil
+	}
+
+	selected := make([]scoredResult, 0, limit)
+	remaining := append([]scoredResult(nil), candidates...)
+	selected = append(selected, remaining[0])
+	remaining = remaining[1:]
+
+	for len(selected) < limit && len(remaining) > 0 {
+		bestIdx := 0
+		bestScore := math.Inf(-1)
+		for i, candidate := range remaining {
+			penalty := maxNoveltyPenalty(candidate, selected)
+			mmrScore := candidate.score - penalty
+			if mmrScore > bestScore {
+				bestScore = mmrScore
+				bestIdx = i
+			}
+		}
+
+		selected = append(selected, remaining[bestIdx])
+		remaining = append(remaining[:bestIdx], remaining[bestIdx+1:]...)
+	}
+
+	return selected
+}
+
+func maxNoveltyPenalty(candidate scoredResult, selected []scoredResult) float64 {
+	maxPenalty := 0.0
+	for _, chosen := range selected {
+		penalty := tokenOverlap(candidate.tokens, chosen.tokens) * 0.18
+		if candidate.result.Source == chosen.result.Source {
+			penalty += 0.05
+			if candidate.result.SectionTitle != "" && candidate.result.SectionTitle == chosen.result.SectionTitle {
+				penalty += 0.08
+			}
+			if absInt(candidate.result.ChunkIndex-chosen.result.ChunkIndex) <= 1 {
+				penalty += 0.06
+			}
+			if absInt(candidate.result.PageNumber-chosen.result.PageNumber) <= 1 {
+				penalty += 0.04
+			}
+		}
+		if penalty > maxPenalty {
+			maxPenalty = penalty
+		}
+	}
+	return maxPenalty
+}
+
+func tokenOverlap(a, b map[string]struct{}) float64 {
+	if len(a) == 0 || len(b) == 0 {
+		return 0
+	}
+
+	shared := float64(sharedTokenCount(a, b))
+	denom := float64(minInt(len(a), len(b)))
+	if denom == 0 {
+		return 0
+	}
+	return shared / denom
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
 }

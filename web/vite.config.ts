@@ -8,6 +8,7 @@ export default defineConfig({
       '/search': 'http://localhost:8080',
       '/chat': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
+      '/documents': 'http://localhost:8080',
     },
   },
   build: {
