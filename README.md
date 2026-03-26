@@ -192,6 +192,8 @@ curl http://localhost:8080/health
 | `AZURE_CHAT_DEPLOYMENT` | empty | Azure OpenAI chat deployment |
 | `RECALL_K` | `20` | Number of chunks to pull from vector search before reranking |
 | `TOP_K` | `3` | Final number of chunks returned to search/RAG after reranking |
+| `PROMPT_VERSION` | `prompt-v1` | Prompt version label attached to answer/search runs |
+| `CONFIG_VERSION` | `retrieval-v1` | Retrieval/config version label attached to answer/search runs |
 | `GUARDRAILS_ENABLED` | `false` | Enables guardrail checks for user input, retrieval flow, and model output |
 | `CONTENT_SAFETY_ENDPOINT` | empty | Optional Azure AI Content Safety endpoint |
 | `CONTENT_SAFETY_API_KEY` | empty | Optional Azure AI Content Safety API key |
@@ -230,6 +232,36 @@ By default it reads `evals/policy_eval_set.jsonl`, runs the current retrieval + 
 - citation presence
 - forbidden-source leakage
 - guardrail blocking for safety cases (or skips them when guardrails are disabled)
+
+## Retrieval observability
+
+Both `/search` and `/chat` now emit lightweight run metadata in successful responses:
+
+- `run.run_id`
+- `run.prompt_version`
+- `run.config_version`
+- `run.source_scope`
+- `run.total_latency_ms`
+
+You can also request full retrieval traces for debugging:
+
+```bash
+curl "http://localhost:8080/search?q=breakdown+recovery&debug=true"
+```
+
+```bash
+curl -X POST http://localhost:8080/chat \
+  -H "Content-Type: application/json" \
+  -d '{"question":"Does breakdown assistance include roadside recovery?","source":"breakdown.pdf","debug":true}'
+```
+
+The trace includes:
+
+- candidate chunks returned from vector recall
+- base and reranked scores
+- matched-token coverage
+- which chunks were discarded, filtered, or selected
+- embedding, search, rerank, and total latency
 
 ### Azure AI Foundry / Azure OpenAI
 

@@ -16,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
 	"github.com/pdf-rag/internal/ai"
+	"github.com/pdf-rag/internal/evals"
 	"github.com/pdf-rag/internal/guardrails"
 	"github.com/pdf-rag/internal/rag"
 	"github.com/pdf-rag/internal/store"
@@ -30,6 +31,9 @@ func main() {
 	topK := normalizeTopK(getEnvInt("TOP_K", 3))
 	recallK := getEnvInt("RECALL_K", 20)
 	port := getEnv("PORT", "8080")
+	promptVersion := getEnv("PROMPT_VERSION", "prompt-v1")
+	configVersion := getEnv("CONFIG_VERSION", "retrieval-v1")
+	evalSetPath := getEnv("EVAL_SET_PATH", "evals/policy_eval_set.jsonl")
 
 	aiClient, err := ai.New(ai.Config{
 		Provider:             getEnv("AI_PROVIDER", "ollama"),
@@ -74,6 +78,8 @@ func main() {
 		RecallK:       recallK,
 		FinalContextK: topK,
 		Guardrails:    guardrailService,
+		PromptVersion: promptVersion,
+		ConfigVersion: configVersion,
 	})
 
 	r := chi.NewRouter()
@@ -94,6 +100,17 @@ func main() {
 		writeJSON(w, http.StatusOK, map[string]any{"sources": sources})
 	})
 
+	r.Get("/eval/questions", func(w http.ResponseWriter, req *http.Request) {
+		includeSafety := getRequestDebug(req.URL.Query().Get("includeSafety"))
+		questions, err := evals.LoadQuestions(evalSetPath, includeSafety)
+		if err != nil {
+			log.Printf("eval questions error: %v", err)
+			http.Error(w, `{"error":"eval questions failed"}`, http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"questions": questions})
+	})
+
 	// GET /search?q=<query>&k=5
 	r.Get("/search", func(w http.ResponseWriter, req *http.Request) {
 		q := req.URL.Query().Get("q")
@@ -108,10 +125,19 @@ func main() {
 			}
 		}
 		source := strings.TrimSpace(req.URL.Query().Get("source"))
+		debug := getRequestDebug(req.URL.Query().Get("debug"))
 
-		results, err := searcher.SearchWithSource(req.Context(), q, k, source)
+		results, trace, err := searcher.SearchWithSourceTrace(req.Context(), q, k, source)
 		if err != nil {
 			writeAppError(w, "search", err)
+			return
+		}
+		if debug {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"results": results,
+				"run":     trace.Summary(),
+				"trace":   trace,
+			})
 			return
 		}
 		writeJSON(w, http.StatusOK, results)
@@ -122,6 +148,7 @@ func main() {
 		var body struct {
 			Question string `json:"question"`
 			Source   string `json:"source"`
+			Debug    bool   `json:"debug"`
 		}
 		if err := json.NewDecoder(req.Body).Decode(&body); err != nil || body.Question == "" {
 			http.Error(w, `{"error":"question is required"}`, http.StatusBadRequest)
@@ -134,10 +161,22 @@ func main() {
 			return
 		}
 
+		if body.Debug {
+			writeJSON(w, http.StatusOK, map[string]any{
+				"answer":     answer.Text,
+				"sources":    answer.Sources,
+				"assessment": answer.Assessment,
+				"run":        answer.Trace.Summary(),
+				"trace":      answer.Trace,
+			})
+			return
+		}
+
 		writeJSON(w, http.StatusOK, map[string]any{
 			"answer":     answer.Text,
 			"sources":    answer.Sources,
 			"assessment": answer.Assessment,
+			"run":        answer.Trace.Summary(),
 		})
 	})
 
@@ -252,6 +291,11 @@ func normalizeTopK(value int) int {
 		return 3
 	}
 	return value
+}
+
+func getRequestDebug(value string) bool {
+	value = strings.TrimSpace(strings.ToLower(value))
+	return value == "1" || value == "true" || value == "yes" || value == "on"
 }
 
 func resolveDocumentPath(docsDir, source string) (string, error) {

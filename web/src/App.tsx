@@ -9,11 +9,84 @@ pdfjs.GlobalWorkerOptions.workerSrc = pdfWorker
 
 interface Source {
   id: number
+  document_id?: string
   source: string
   page_number: number
   section_title: string
   content: string
   score: number
+}
+
+interface RunMetadata {
+  run_id: string
+  prompt_version: string
+  config_version: string
+  source_scope: string
+  total_latency_ms: number
+}
+
+interface ScoreBreakdown {
+  semantic_similarity: number
+  content_token_boost: number
+  title_token_boost: number
+  caption_token_boost: number
+  source_token_boost: number
+  coverage_boost: number
+  metadata_bonus: number
+  token_penalty: number
+}
+
+interface RetrievalCandidateTrace {
+  id: number
+  document_id: string
+  source: string
+  chunk_index: number
+  page_number: number
+  section_title: string
+  excerpt: string
+  base_score: number
+  final_score: number
+  rerank_delta: number
+  diversity_penalty: number
+  matched_tokens: number
+  query_token_count: number
+  content_matches: number
+  title_matches: number
+  caption_matches: number
+  source_matches: number
+  coverage: number
+  matched_terms: string[]
+  stage: 'selected' | 'filtered' | 'discarded'
+  reason_summary: string
+  selection_explanation: string
+  score_breakdown: ScoreBreakdown
+}
+
+interface RetrievalTrace {
+  run_id: string
+  query: string
+  query_terms: string[]
+  source_scope: string
+  prompt_version: string
+  config_version: string
+  recall_k: number
+  final_context_k: number
+  total_candidates: number
+  filtered_candidates: number
+  selected_candidates: number
+  relevance_floor: number
+  embedding_latency_ms: number
+  search_latency_ms: number
+  rerank_latency_ms: number
+  total_latency_ms: number
+  candidates: RetrievalCandidateTrace[]
+}
+
+interface EvalQuestion {
+  id: string
+  category: string
+  question: string
+  source?: string
 }
 
 interface Assessment {
@@ -32,6 +105,8 @@ interface AnswerCardData {
   answer: string
   sources: Source[]
   assessment?: Assessment
+  run?: RunMetadata
+  trace?: RetrievalTrace
 }
 
 interface CitationTarget {
@@ -361,6 +436,206 @@ function AssessmentCard({ assessment }: { assessment: Assessment }) {
   )
 }
 
+function formatStageLabel(stage: RetrievalCandidateTrace['stage']) {
+  if (stage === 'selected') return 'Used in answer'
+  if (stage === 'filtered') return 'Relevant but not used'
+  return 'Dropped early'
+}
+
+function formatSigned(value: number) {
+  if (value > 0) return `+${value.toFixed(3)}`
+  return value.toFixed(3)
+}
+
+function explainScope(scope: string) {
+  return scope ? `Search was restricted to ${scope}.` : 'Search ran across all indexed policies, then grouped evidence by document.'
+}
+
+function explainPipeline(trace: RetrievalTrace) {
+  return `The system embedded your question, recalled ${trace.total_candidates} candidate chunks, kept ${trace.filtered_candidates} after relevance filtering, and passed ${trace.selected_candidates} into the final answer context.`
+}
+
+function DiagnosticsCard({ run, trace }: { run?: RunMetadata; trace?: RetrievalTrace }) {
+  const [expanded, setExpanded] = useState(false)
+
+  if (!run) return null
+
+  return (
+    <section className="diagnostics-card" aria-label="Retrieval diagnostics">
+      <button className="diagnostics-toggle" type="button" onClick={() => setExpanded((current) => !current)} aria-expanded={expanded}>
+        <div className="diagnostics-header">
+          <div>
+            <p className="diagnostics-kicker">Diagnostics</p>
+            <h3>Run {run.run_id}</h3>
+            <p className="diagnostics-subtitle">
+              Prompt `{run.prompt_version}` · Config `{run.config_version}`
+            </p>
+          </div>
+          <div className="diagnostics-header-right">
+            <span className="diagnostics-badge">{run.total_latency_ms} ms</span>
+            <span className="assessment-toggle-icon" aria-hidden="true">
+              {expanded ? '−' : '+'}
+            </span>
+          </div>
+        </div>
+      </button>
+
+      {expanded && trace && (
+        <div className="diagnostics-content">
+          <div className="diagnostics-explainer">
+            <p className="diagnostics-explainer-title">What this panel means</p>
+            <p>{explainPipeline(trace)}</p>
+            <p>{explainScope(trace.source_scope)}</p>
+          </div>
+
+          <div className="diagnostics-grid">
+            <div className="diagnostics-metric">
+              <span>Scope</span>
+              <strong>{trace.source_scope || 'All policies'}</strong>
+              <small>{trace.source_scope ? 'Only this document was eligible.' : 'Every policy could compete for retrieval.'}</small>
+            </div>
+            <div className="diagnostics-metric">
+              <span>Recall / final</span>
+              <strong>
+                {trace.recall_k} / {trace.final_context_k}
+              </strong>
+              <small>{trace.recall_k} chunks were recalled first, then only {trace.final_context_k} were allowed into the final prompt.</small>
+            </div>
+            <div className="diagnostics-metric">
+              <span>Embed</span>
+              <strong>{trace.embedding_latency_ms} ms</strong>
+              <small>Time spent turning the question into a vector for semantic search.</small>
+            </div>
+            <div className="diagnostics-metric">
+              <span>Search + rerank</span>
+              <strong>
+                {trace.search_latency_ms + trace.rerank_latency_ms} ms
+              </strong>
+              <small>Vector lookup plus the token-aware reranker and diversity pass.</small>
+            </div>
+            <div className="diagnostics-metric">
+              <span>Candidates kept</span>
+              <strong>
+                {trace.filtered_candidates} / {trace.total_candidates}
+              </strong>
+              <small>These survived the relevance floor before final selection.</small>
+            </div>
+            <div className="diagnostics-metric">
+              <span>Relevance floor</span>
+              <strong>{trace.relevance_floor.toFixed(3)}</strong>
+              <small>Chunks under this rerank score were usually treated as noise.</small>
+            </div>
+          </div>
+
+          {trace.query_terms.length > 0 && (
+            <div className="diagnostics-section">
+              <div className="diagnostics-section-header">
+                <strong>Query terms the reranker noticed</strong>
+                <span>{trace.query_terms.length} terms</span>
+              </div>
+              <p className="diagnostics-section-copy">
+                These are the normalized words used for token overlap checks in titles, captions, content, and filenames.
+              </p>
+              <div className="diagnostics-token-list">
+                {trace.query_terms.map((term) => (
+                  <span key={term} className="diagnostics-token-chip">
+                    {term}
+                  </span>
+                ))}
+              </div>
+            </div>
+          )}
+
+          <div className="diagnostics-section">
+            <div className="diagnostics-section-header">
+              <strong>How candidate statuses work</strong>
+            </div>
+            <ul className="diagnostics-legend">
+              <li>
+                <strong>Used in answer</strong> means the chunk made it into the final context sent to the model.
+              </li>
+              <li>
+                <strong>Relevant but not used</strong> means the chunk looked good, but it lost to stronger or more diverse chunks.
+              </li>
+              <li>
+                <strong>Dropped early</strong> means the chunk stayed in the recall set but looked too weak or noisy after reranking.
+              </li>
+            </ul>
+          </div>
+
+          <div className="diagnostics-candidates">
+            {trace.candidates.map((candidate) => (
+              <div key={`${candidate.source}-${candidate.chunk_index}-${candidate.page_number}`} className={`diagnostics-candidate diagnostics-candidate--${candidate.stage}`}>
+                <div className="diagnostics-candidate-top">
+                  <strong>
+                    {candidate.source} · p.{candidate.page_number}
+                  </strong>
+                  <span>{formatStageLabel(candidate.stage)}</span>
+                </div>
+                {candidate.section_title && <p>{candidate.section_title}</p>}
+                <p className="diagnostics-candidate-summary">{candidate.reason_summary}</p>
+                <p className="diagnostics-candidate-explanation">{candidate.selection_explanation}</p>
+                {candidate.excerpt && <p className="diagnostics-candidate-excerpt">“{candidate.excerpt}”</p>}
+                {candidate.matched_terms.length > 0 && (
+                  <div className="diagnostics-token-list diagnostics-token-list--candidate">
+                    {candidate.matched_terms.map((term) => (
+                      <span key={`${candidate.id}-${term}`} className="diagnostics-token-chip diagnostics-token-chip--matched">
+                        {term}
+                      </span>
+                    ))}
+                  </div>
+                )}
+                <div className="diagnostics-candidate-metrics">
+                  <span>base {candidate.base_score.toFixed(3)}</span>
+                  <span>final {candidate.final_score.toFixed(3)}</span>
+                  <span>delta {formatSigned(candidate.rerank_delta)}</span>
+                  <span>tokens {candidate.matched_tokens}/{candidate.query_token_count}</span>
+                  <span>coverage {(candidate.coverage * 100).toFixed(0)}%</span>
+                  <span>diversity penalty {candidate.diversity_penalty.toFixed(3)}</span>
+                </div>
+                <div className="diagnostics-breakdown">
+                  <div className="diagnostics-breakdown-row">
+                    <span>Semantic similarity</span>
+                    <strong>{candidate.score_breakdown.semantic_similarity.toFixed(3)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Content term boost ({candidate.content_matches} matches)</span>
+                    <strong>{formatSigned(candidate.score_breakdown.content_token_boost)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Section title boost ({candidate.title_matches} matches)</span>
+                    <strong>{formatSigned(candidate.score_breakdown.title_token_boost)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Caption boost ({candidate.caption_matches} matches)</span>
+                    <strong>{formatSigned(candidate.score_breakdown.caption_token_boost)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Filename/source boost ({candidate.source_matches} matches)</span>
+                    <strong>{formatSigned(candidate.score_breakdown.source_token_boost)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Coverage boost</span>
+                    <strong>{formatSigned(candidate.score_breakdown.coverage_boost)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Metadata bonus</span>
+                    <strong>{formatSigned(candidate.score_breakdown.metadata_bonus)}</strong>
+                  </div>
+                  <div className="diagnostics-breakdown-row">
+                    <span>Low-overlap penalty</span>
+                    <strong>{formatSigned(candidate.score_breakdown.token_penalty)}</strong>
+                  </div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </section>
+  )
+}
+
 function AnswerCard({ card }: { card: AnswerCardData }) {
   const [showSources, setShowSources] = useState(false)
   const [expandedSourceId, setExpandedSourceId] = useState<number | null>(null)
@@ -464,6 +739,7 @@ function AnswerCard({ card }: { card: AnswerCardData }) {
         )}
 
         {card.assessment && <AssessmentCard assessment={card.assessment} />}
+        <DiagnosticsCard run={card.run} trace={card.trace} />
       </article>
 
       {viewerSource && (
@@ -483,17 +759,11 @@ export default function App() {
   const [input, setInput] = useState('')
   const [selectedSource, setSelectedSource] = useState('')
   const [availableSources, setAvailableSources] = useState<string[]>([])
+  const [suggestionQuestions, setSuggestionQuestions] = useState<EvalQuestion[]>([])
+  const [showDiagnostics, setShowDiagnostics] = useState(true)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
-
-  const suggestionQuestions = [
-    'Does travel insurance cover flight cancellations?',
-    'Does my policy cover adventure sports?',
-    'How do I make a claim while abroad?',
-    'Will I be covered if I get sick before travel?',
-    'What happens if my luggage is lost or stolen?',
-  ]
 
   function goHome() {
     setCurrentCard(null)
@@ -505,16 +775,22 @@ export default function App() {
   useEffect(() => {
     let cancelled = false
 
-    async function loadSources() {
+    async function loadInitialData() {
       try {
-        const res = await fetch('/sources')
-        if (!res.ok) {
-          throw new Error(await readErrorMessage(res))
+        const [sourcesRes, questionsRes] = await Promise.all([fetch('/sources'), fetch('/eval/questions')])
+
+        if (!sourcesRes.ok) {
+          throw new Error(await readErrorMessage(sourcesRes))
+        }
+        if (!questionsRes.ok) {
+          throw new Error(await readErrorMessage(questionsRes))
         }
 
-        const data = await res.json()
+        const sourcesData = await sourcesRes.json()
+        const questionsData = await questionsRes.json()
         if (!cancelled) {
-          setAvailableSources(data.sources ?? [])
+          setAvailableSources(sourcesData.sources ?? [])
+          setSuggestionQuestions(questionsData.questions ?? [])
         }
       } catch (err) {
         if (!cancelled) {
@@ -523,7 +799,7 @@ export default function App() {
       }
     }
 
-    void loadSources()
+    void loadInitialData()
 
     return () => {
       cancelled = true
@@ -544,7 +820,7 @@ export default function App() {
       const res = await fetch('/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, source: selectedSource || undefined }),
+        body: JSON.stringify({ question, source: selectedSource || undefined, debug: showDiagnostics }),
       })
 
       if (!res.ok) {
@@ -559,6 +835,8 @@ export default function App() {
         answer: data.answer,
         sources: data.sources ?? [],
         assessment: data.assessment,
+        run: data.run,
+        trace: data.trace,
       })
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Something went wrong')
@@ -602,6 +880,10 @@ export default function App() {
               </select>
             </label>
             {!selectedSource && <p className="source-select-label">Multi-policy answers stay grouped by source document.</p>}
+            <label className="diagnostics-toggle-row">
+              <input type="checkbox" checked={showDiagnostics} onChange={(event) => setShowDiagnostics(event.target.checked)} />
+              <span>Show retrieval diagnostics</span>
+            </label>
 
             <div className="search-row">
               <div className="search-input-wrap">
@@ -641,16 +923,23 @@ export default function App() {
             </div>
           )}
 
-          {!currentCard && !loading && (
-            <section className="suggestions-panel" aria-label="Suggested questions">
+            {!currentCard && !loading && (
+              <section className="suggestions-panel" aria-label="Suggested questions">
               {suggestionQuestions.map((question) => (
                 <button
-                  key={question}
+                  key={question.id}
                   className="suggestion-pill"
                   type="button"
-                  onClick={() => void submitQuestion(question)}
+                  onClick={() => {
+                    setSelectedSource(question.source ?? '')
+                    void submitQuestion(question.question)
+                  }}
                 >
-                  {question}
+                  <span className="suggestion-pill-title">{question.question}</span>
+                  <span className="suggestion-pill-meta">
+                    {question.category}
+                    {question.source ? ` · ${question.source}` : ' · all policies'}
+                  </span>
                 </button>
               ))}
             </section>

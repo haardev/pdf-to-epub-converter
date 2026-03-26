@@ -10,6 +10,7 @@ export default defineConfig({
       '/health': 'http://localhost:8080',
       '/sources': 'http://localhost:8080',
       '/documents': 'http://localhost:8080',
+      '/eval': 'http://localhost:8080',
     },
   },
   build: {

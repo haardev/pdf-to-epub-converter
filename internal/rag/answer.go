@@ -15,6 +15,7 @@ type Answer struct {
 	Text       string
 	Sources    []store.Result
 	Assessment AnswerAssessment
+	Trace      *RetrievalTrace
 }
 
 type AnswerAssessment struct {
@@ -36,7 +37,7 @@ func (s *Searcher) Ask(ctx context.Context, question string, k int) (*Answer, er
 }
 
 func (s *Searcher) AskWithSource(ctx context.Context, question string, k int, source string) (*Answer, error) {
-	sources, err := s.SearchWithSource(ctx, question, k, source)
+	sources, trace, err := s.SearchWithSourceTrace(ctx, question, k, source)
 	if err != nil {
 		return nil, err
 	}
@@ -58,6 +59,7 @@ func (s *Searcher) AskWithSource(ctx context.Context, question string, k int, so
 		Text:       text,
 		Sources:    sources,
 		Assessment: assessAnswer(question, sources),
+		Trace:      trace,
 	}, nil
 }
 
