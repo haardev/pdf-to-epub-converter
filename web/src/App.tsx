@@ -509,7 +509,7 @@ export default function App() {
       try {
         const res = await fetch('/sources')
         if (!res.ok) {
-          throw new Error(`Request failed: ${res.status}`)
+          throw new Error(await readErrorMessage(res))
         }
 
         const data = await res.json()
@@ -548,7 +548,7 @@ export default function App() {
       })
 
       if (!res.ok) {
-        throw new Error(`Request failed: ${res.status}`)
+        throw new Error(await readErrorMessage(res))
       }
 
       const data = await res.json()
@@ -586,14 +586,14 @@ export default function App() {
         <section className="phone-frame">
           <form className="search-form" onSubmit={handleSubmit}>
             <label className="source-select-wrap">
-              <span className="source-select-label">Policy</span>
+              <span className="source-select-label">Policy scope</span>
               <select
                 className="source-select"
                 value={selectedSource}
                 onChange={(event) => setSelectedSource(event.target.value)}
                 disabled={loading}
               >
-                <option value="">All policies</option>
+                <option value="">All policies (group answers by document)</option>
                 {availableSources.map((source) => (
                   <option key={source} value={source}>
                     {source}
@@ -601,6 +601,7 @@ export default function App() {
                 ))}
               </select>
             </label>
+            {!selectedSource && <p className="source-select-label">Multi-policy answers stay grouped by source document.</p>}
 
             <div className="search-row">
               <div className="search-input-wrap">
@@ -678,4 +679,17 @@ export default function App() {
       </main>
     </div>
   )
+}
+
+async function readErrorMessage(res: Response) {
+  try {
+    const data = (await res.json()) as { error?: string }
+    if (typeof data.error === 'string' && data.error.trim()) {
+      return data.error
+    }
+  } catch {
+    // Ignore JSON parsing failures and fall back to the HTTP status.
+  }
+
+  return `Request failed: ${res.status}`
 }

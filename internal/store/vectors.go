@@ -11,6 +11,7 @@ import (
 // Result holds a retrieved document chunk and its similarity score.
 type Result struct {
 	ID           int      `json:"id"`
+	DocumentID   string   `json:"document_id"`
 	Source       string   `json:"source"`
 	ChunkIndex   int      `json:"chunk_index"`
 	PageNumber   int      `json:"page_number"`
@@ -24,17 +25,18 @@ type Result struct {
 // Duplicate (source, chunk_index) pairs are replaced.
 func (db *DB) UpsertChunk(ctx context.Context, source, content string, idx int, pageNumber int, sectionTitle string, captions []string, embedding []float32) error {
 	const q = `
-INSERT INTO documents (source, chunk_index, page_number, section_title, captions, content, embedding)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO documents (document_id, source, chunk_index, page_number, section_title, captions, content, embedding)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 ON CONFLICT (source, chunk_index)
 DO UPDATE SET
+    document_id = EXCLUDED.document_id,
     page_number = EXCLUDED.page_number,
     section_title = EXCLUDED.section_title,
     captions = EXCLUDED.captions,
     content = EXCLUDED.content,
     embedding = EXCLUDED.embedding`
 
-	if _, err := db.Pool.Exec(ctx, q, source, idx, pageNumber, sectionTitle, strings.Join(captions, "\n"), content, pgvector.NewVector(embedding)); err != nil {
+	if _, err := db.Pool.Exec(ctx, q, source, source, idx, pageNumber, sectionTitle, strings.Join(captions, "\n"), content, pgvector.NewVector(embedding)); err != nil {
 		return fmt.Errorf("upsert chunk: %w", err)
 	}
 	return nil
@@ -53,12 +55,12 @@ func (db *DB) DeleteSourceChunks(ctx context.Context, source string) error {
 // cosine distance (operator <=>).
 func (db *DB) SearchSimilar(ctx context.Context, embedding []float32, k int, source string) ([]Result, error) {
 	q := `
-SELECT id, source, chunk_index, page_number, section_title, captions, content,
+SELECT id, document_id, source, chunk_index, page_number, section_title, captions, content,
        1 - (embedding <=> $1) AS score
 FROM   documents`
 	args := []any{pgvector.NewVector(embedding)}
 	if strings.TrimSpace(source) != "" {
-		q += ` WHERE source = $2`
+		q += ` WHERE document_id = $2`
 		args = append(args, source)
 		q += ` ORDER BY embedding <=> $1 LIMIT $3`
 		args = append(args, k)
@@ -77,7 +79,7 @@ FROM   documents`
 	for rows.Next() {
 		var r Result
 		var captions string
-		if err := rows.Scan(&r.ID, &r.Source, &r.ChunkIndex, &r.PageNumber, &r.SectionTitle, &captions, &r.Content, &r.Score); err != nil {
+		if err := rows.Scan(&r.ID, &r.DocumentID, &r.Source, &r.ChunkIndex, &r.PageNumber, &r.SectionTitle, &captions, &r.Content, &r.Score); err != nil {
 			return nil, fmt.Errorf("scan row: %w", err)
 		}
 		if captions != "" {
@@ -89,7 +91,7 @@ FROM   documents`
 }
 
 func (db *DB) ListSources(ctx context.Context) ([]string, error) {
-	rows, err := db.Pool.Query(ctx, `SELECT DISTINCT source FROM documents ORDER BY source`)
+	rows, err := db.Pool.Query(ctx, `SELECT DISTINCT document_id FROM documents ORDER BY document_id`)
 	if err != nil {
 		return nil, fmt.Errorf("list sources: %w", err)
 	}

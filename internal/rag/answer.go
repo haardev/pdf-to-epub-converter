@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"regexp"
 	"strings"
 
 	"github.com/pdf-rag/internal/store"
@@ -26,6 +27,8 @@ type AnswerAssessment struct {
 	Reasons         []string `json:"reasons"`
 }
 
+var inlineCitationPattern = regexp.MustCompile(`\([^)]+,\s*page\s+\d+\)`)
+
 // Ask retrieves relevant chunks for the question, builds a RAG prompt, sends
 // it to the generative model, and returns the answer with sources.
 func (s *Searcher) Ask(ctx context.Context, question string, k int) (*Answer, error) {
@@ -38,11 +41,17 @@ func (s *Searcher) AskWithSource(ctx context.Context, question string, k int, so
 		return nil, err
 	}
 
-	prompt := buildPrompt(question, sources)
+	prompt := buildPrompt(question, source, sources)
 
 	text, err := s.ai.Generate(prompt)
 	if err != nil {
 		return nil, fmt.Errorf("generate answer: %w", err)
+	}
+	text = ensureCitations(text, sources)
+	if s.guardrails != nil {
+		if err := s.guardrails.CheckModelOutput(ctx, text); err != nil {
+			return nil, err
+		}
 	}
 
 	return &Answer{
@@ -52,15 +61,21 @@ func (s *Searcher) AskWithSource(ctx context.Context, question string, k int, so
 	}, nil
 }
 
-func buildPrompt(question string, chunks []store.Result) string {
+func buildPrompt(question, source string, chunks []store.Result) string {
 	var sb strings.Builder
 
 	sb.WriteString("You are a helpful assistant that answers questions about insurance policy documents.\n")
 	sb.WriteString("Answer ONLY using the context provided below. Do not guess or make up information.\n")
 	sb.WriteString("If the context does not contain enough information to answer, say so clearly.\n\n")
-	sb.WriteString("Treat each source document as a separate policy document.\n")
-	sb.WriteString("Never merge coverage, exclusions, or limits from different source documents into one policy answer.\n")
-	sb.WriteString("If multiple source documents are relevant, compare them explicitly and say which document each statement comes from.\n\n")
+	if strings.TrimSpace(source) != "" {
+		fmt.Fprintf(&sb, "The user selected the single policy document %q.\n", source)
+		sb.WriteString("Answer only for that document and do not bring in information from any other policy.\n\n")
+	} else {
+		sb.WriteString("All Policies mode is enabled.\n")
+		sb.WriteString("Treat each source document as a separate policy document.\n")
+		sb.WriteString("Never merge coverage, exclusions, or limits from different source documents into one blended policy answer.\n")
+		sb.WriteString("If multiple source documents are relevant, compare them explicitly and keep the answer grouped by source document.\n\n")
+	}
 
 	sb.WriteString("## Formatting rules\n")
 	sb.WriteString("- Write in clear, plain English that anyone can understand — avoid jargon.\n")
@@ -68,8 +83,9 @@ func buildPrompt(question string, chunks []store.Result) string {
 	sb.WriteString("- Use bullet points for lists of conditions, exclusions, or requirements.\n")
 	sb.WriteString("- Use **bold** to highlight key terms, amounts, and important limits.\n")
 	sb.WriteString("- Cite every factual statement inline using this exact format using the real filename from the context, e.g. (flex-plus.pdf, page 5).\n")
+	sb.WriteString("- Every sentence or bullet with a factual claim MUST end with a citation. If you cannot cite it, leave it out.\n")
 	sb.WriteString("- Do not add labels like 'source:' or 'policy:' inside citations.\n")
-	sb.WriteString("- If more than one policy document is relevant, keep the answer grouped by source document so the user can tell them apart.\n")
+	sb.WriteString("- If more than one policy document is relevant, use a separate subsection for each source document so the user can tell them apart.\n")
 	sb.WriteString("- End with a short summary or any important caveats to be aware of.\n\n")
 
 	sb.WriteString("## Context from the document\n\n")
@@ -88,6 +104,28 @@ func buildPrompt(question string, chunks []store.Result) string {
 	sb.WriteString("## Question\n\n")
 	sb.WriteString(question)
 	sb.WriteString("\n\n## Answer\n\n")
+	return sb.String()
+}
+
+func ensureCitations(answer string, sources []store.Result) string {
+	if inlineCitationPattern.MatchString(answer) || len(sources) == 0 {
+		return answer
+	}
+
+	var sb strings.Builder
+	sb.WriteString(strings.TrimSpace(answer))
+	sb.WriteString("\n\nSupporting citations:\n")
+
+	seen := make(map[string]struct{})
+	for _, source := range sources {
+		citation := fmt.Sprintf("(%s, page %d)", source.Source, source.PageNumber)
+		if _, ok := seen[citation]; ok {
+			continue
+		}
+		seen[citation] = struct{}{}
+		fmt.Fprintf(&sb, "- %s\n", citation)
+	}
+
 	return sb.String()
 }
 

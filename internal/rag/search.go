@@ -8,13 +8,17 @@ import (
 	"strings"
 
 	"github.com/pdf-rag/internal/ai"
+	"github.com/pdf-rag/internal/guardrails"
 	"github.com/pdf-rag/internal/store"
 )
 
 // Searcher performs semantic search against the vector store.
 type Searcher struct {
-	ai ai.Client
-	db *store.DB
+	ai            ai.Client
+	db            *store.DB
+	recallK       int
+	finalContextK int
+	guardrails    *guardrails.Service
 }
 
 type scoredResult struct {
@@ -27,7 +31,36 @@ type scoredResult struct {
 
 // NewSearcher creates a Searcher.
 func NewSearcher(client ai.Client, db *store.DB) *Searcher {
-	return &Searcher{ai: client, db: db}
+	return NewSearcherWithConfig(client, db, SearchConfig{})
+}
+
+type SearchConfig struct {
+	RecallK       int
+	FinalContextK int
+	Guardrails    *guardrails.Service
+}
+
+func NewSearcherWithConfig(client ai.Client, db *store.DB, cfg SearchConfig) *Searcher {
+	recallK := cfg.RecallK
+	if recallK <= 0 {
+		recallK = 20
+	}
+
+	finalContextK := cfg.FinalContextK
+	if finalContextK <= 0 {
+		finalContextK = 3
+	}
+	if finalContextK > 3 {
+		finalContextK = 3
+	}
+
+	return &Searcher{
+		ai:            client,
+		db:            db,
+		recallK:       recallK,
+		finalContextK: finalContextK,
+		guardrails:    cfg.Guardrails,
+	}
 }
 
 // Search embeds the query and returns the top-k most similar chunks.
@@ -38,19 +71,58 @@ func (s *Searcher) Search(ctx context.Context, query string, k int) ([]store.Res
 // SearchWithSource embeds the query and returns relevant chunks, optionally
 // restricted to a single source document.
 func (s *Searcher) SearchWithSource(ctx context.Context, query string, k int, source string) ([]store.Result, error) {
+	if s.guardrails != nil {
+		if err := s.guardrails.CheckUserInput(ctx, query); err != nil {
+			return nil, err
+		}
+		toolCall := fmt.Sprintf("semantic_search scope=%q query=%s", strings.TrimSpace(source), query)
+		if err := s.guardrails.CheckToolCall(ctx, toolCall); err != nil {
+			return nil, err
+		}
+	}
+
 	vec, err := s.ai.Embed(query)
 	if err != nil {
 		return nil, fmt.Errorf("embed query: %w", err)
 	}
 
-	recallSize := maxInt(k*5, 20)
+	finalK := clampFinalK(k, s.finalContextK)
 
-	results, err := s.db.SearchSimilar(ctx, vec, recallSize, source)
-	if err != nil {
-		return nil, fmt.Errorf("similarity search: %w", err)
+	if strings.TrimSpace(source) != "" {
+		results, err := s.db.SearchSimilar(ctx, vec, s.recallK, source)
+		if err != nil {
+			return nil, fmt.Errorf("similarity search: %w", err)
+		}
+		selected := rerankResults(query, results, finalK)
+		if s.guardrails != nil {
+			if err := s.guardrails.CheckToolResponse(ctx, resultContents(selected)); err != nil {
+				return nil, err
+			}
+		}
+		return selected, nil
 	}
 
-	return rerankResults(query, results, k), nil
+	sources, err := s.db.ListSources(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list sources: %w", err)
+	}
+
+	var aggregated []store.Result
+	for _, documentID := range sources {
+		results, searchErr := s.db.SearchSimilar(ctx, vec, s.recallK, documentID)
+		if searchErr != nil {
+			return nil, fmt.Errorf("similarity search for %s: %w", documentID, searchErr)
+		}
+		aggregated = append(aggregated, results...)
+	}
+
+	selected := rerankResults(query, aggregated, finalK)
+	if s.guardrails != nil {
+		if err := s.guardrails.CheckToolResponse(ctx, resultContents(selected)); err != nil {
+			return nil, err
+		}
+	}
+	return selected, nil
 }
 
 func rerankResults(query string, results []store.Result, k int) []store.Result {
@@ -58,9 +130,7 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 	if len(results) == 0 {
 		return results
 	}
-	if k <= 0 {
-		k = 1
-	}
+	k = clampFinalK(k, 3)
 
 	scored := make([]scoredResult, 0, len(results))
 	for _, result := range results {
@@ -112,7 +182,10 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 		filtered = scored[:minInt(len(scored), k)]
 	}
 
-	limit := dynamicResultLimit(filtered, k)
+	limit := minInt(len(filtered), k)
+	if limit == 0 {
+		limit = minInt(len(scored), k)
+	}
 	selected := selectDiverseResults(filtered, limit)
 	sort.SliceStable(selected, func(i, j int) bool {
 		return selected[i].score > selected[j].score
@@ -125,6 +198,30 @@ func rerankResults(query string, results []store.Result, k int) []store.Result {
 	}
 
 	return reranked
+}
+
+func clampFinalK(requested, fallback int) int {
+	if requested <= 0 {
+		requested = fallback
+	}
+	if requested <= 0 {
+		requested = 3
+	}
+	if requested > 3 {
+		return 3
+	}
+	return requested
+}
+
+func resultContents(results []store.Result) []string {
+	documents := make([]string, 0, len(results))
+	for _, result := range results {
+		if strings.TrimSpace(result.Content) == "" {
+			continue
+		}
+		documents = append(documents, result.Content)
+	}
+	return documents
 }
 
 func tokenize(text string) map[string]struct{} {
@@ -179,30 +276,6 @@ func filterRelevantResults(scored []scoredResult, desiredK int) []scoredResult {
 		}
 	}
 	return filtered
-}
-
-func dynamicResultLimit(scored []scoredResult, desiredK int) int {
-	if len(scored) == 0 {
-		return 0
-	}
-
-	maxLimit := minInt(len(scored), desiredK)
-	if maxLimit == 0 {
-		return 0
-	}
-
-	limit := minInt(maxLimit, 3)
-	topScore := scored[0].score
-	for limit < maxLimit {
-		next := scored[limit]
-		if next.score >= topScore*0.96 || scored[limit-1].score-next.score <= 0.02 {
-			limit++
-			continue
-		}
-		break
-	}
-
-	return maxInt(1, limit)
 }
 
 func selectDiverseResults(candidates []scoredResult, limit int) []scoredResult {

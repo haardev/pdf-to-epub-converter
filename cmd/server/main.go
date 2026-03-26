@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io/fs"
 	"log"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/joho/godotenv"
 	"github.com/pdf-rag/internal/ai"
+	"github.com/pdf-rag/internal/guardrails"
 	"github.com/pdf-rag/internal/rag"
 	"github.com/pdf-rag/internal/store"
 	"github.com/pdf-rag/internal/ui"
@@ -25,7 +27,8 @@ func main() {
 
 	dbURL := getEnv("DB_URL", "postgres://rag:rag@localhost:5432/ragdb")
 	docsDir := getEnv("DOCS_DIR", ".")
-	topK := getEnvInt("TOP_K", 5)
+	topK := normalizeTopK(getEnvInt("TOP_K", 3))
+	recallK := getEnvInt("RECALL_K", 20)
 	port := getEnv("PORT", "8080")
 
 	aiClient, err := ai.New(ai.Config{
@@ -53,7 +56,25 @@ func main() {
 	}
 	defer db.Close()
 
-	searcher := rag.NewSearcher(aiClient, db)
+	guardrailService := guardrails.New(guardrails.Config{
+		Enabled:                       getEnvBool("GUARDRAILS_ENABLED", false),
+		ContentSafetyEndpoint:         getEnv("CONTENT_SAFETY_ENDPOINT", ""),
+		ContentSafetyAPIKey:           getEnv("CONTENT_SAFETY_API_KEY", ""),
+		ContentSafetyAPIVersion:       getEnv("CONTENT_SAFETY_API_VERSION", "2024-09-01"),
+		Blocklists:                    splitCSV(getEnv("CONTENT_SAFETY_BLOCKLISTS", "")),
+		InputSeverityThreshold:        getEnvInt("GUARDRAILS_INPUT_SEVERITY_THRESHOLD", 4),
+		ToolCallSeverityThreshold:     getEnvInt("GUARDRAILS_TOOL_CALL_SEVERITY_THRESHOLD", 4),
+		OutputSeverityThreshold:       getEnvInt("GUARDRAILS_OUTPUT_SEVERITY_THRESHOLD", 4),
+		EnableUserPromptShield:        getEnvBool("GUARDRAILS_USER_PROMPT_SHIELD", true),
+		EnableDocumentPromptShield:    getEnvBool("GUARDRAILS_DOCUMENT_PROMPT_SHIELD", true),
+		EnableOutputProtectedMaterial: getEnvBool("GUARDRAILS_OUTPUT_PROTECTED_MATERIAL", false),
+	})
+
+	searcher := rag.NewSearcherWithConfig(aiClient, db, rag.SearchConfig{
+		RecallK:       recallK,
+		FinalContextK: topK,
+		Guardrails:    guardrailService,
+	})
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
@@ -83,15 +104,14 @@ func main() {
 		k := topK
 		if ks := req.URL.Query().Get("k"); ks != "" {
 			if parsed, err := strconv.Atoi(ks); err == nil && parsed > 0 {
-				k = parsed
+				k = normalizeTopK(parsed)
 			}
 		}
 		source := strings.TrimSpace(req.URL.Query().Get("source"))
 
 		results, err := searcher.SearchWithSource(req.Context(), q, k, source)
 		if err != nil {
-			log.Printf("search error: %v", err)
-			http.Error(w, `{"error":"search failed"}`, http.StatusInternalServerError)
+			writeAppError(w, "search", err)
 			return
 		}
 		writeJSON(w, http.StatusOK, results)
@@ -110,8 +130,7 @@ func main() {
 
 		answer, err := searcher.AskWithSource(req.Context(), body.Question, topK, strings.TrimSpace(body.Source))
 		if err != nil {
-			log.Printf("chat error: %v", err)
-			http.Error(w, `{"error":"chat failed"}`, http.StatusInternalServerError)
+			writeAppError(w, "chat", err)
 			return
 		}
 
@@ -169,6 +188,23 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
+func writeAppError(w http.ResponseWriter, operation string, err error) {
+	log.Printf("%s error: %v", operation, err)
+
+	var violation *guardrails.ViolationError
+	if errors.As(err, &violation) {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error": violation.Error(),
+			"phase": violation.Phase,
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusInternalServerError, map[string]string{
+		"error": operation + " failed",
+	})
+}
+
 func getEnv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v
@@ -183,6 +219,39 @@ func getEnvInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+func getEnvBool(key string, fallback bool) bool {
+	if value := strings.TrimSpace(strings.ToLower(os.Getenv(key))); value != "" {
+		return value == "1" || value == "true" || value == "yes" || value == "on"
+	}
+	return fallback
+}
+
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+
+	parts := strings.Split(raw, ",")
+	values := make([]string, 0, len(parts))
+	for _, part := range parts {
+		trimmed := strings.TrimSpace(part)
+		if trimmed != "" {
+			values = append(values, trimmed)
+		}
+	}
+	return values
+}
+
+func normalizeTopK(value int) int {
+	if value <= 0 {
+		return 3
+	}
+	if value > 3 {
+		return 3
+	}
+	return value
 }
 
 func resolveDocumentPath(docsDir, source string) (string, error) {

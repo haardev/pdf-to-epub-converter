@@ -124,7 +124,7 @@ Drop your PDF into `docs/` then run:
 go run ./cmd/ingest docs/my-paper.pdf
 ```
 
-Progress is logged per-chunk. Large PDFs may take a few minutes (embedding calls are sequential). The ingestion pipeline now stores page-aware chunks with section-title and caption metadata, uses smaller semantic chunks by default (`CHUNK_SIZE=90`, `CHUNK_OVERLAP=24`), and retrieves a wider candidate set before reranking the final top results.
+Progress is logged per-chunk. Large PDFs may take a few minutes (embedding calls are sequential). The ingestion pipeline stores page-aware chunks with section-title and caption metadata and now defaults to larger semantic windows (`CHUNK_SIZE=400`, `CHUNK_OVERLAP=100`).
 
 ### 6 — Start the query server
 
@@ -190,8 +190,46 @@ curl http://localhost:8080/health
 | `AZURE_AI_API_VERSION` | provider default | Azure REST API version |
 | `AZURE_EMBED_DEPLOYMENT` | empty | Azure OpenAI embedding deployment |
 | `AZURE_CHAT_DEPLOYMENT` | empty | Azure OpenAI chat deployment |
-| `TOP_K` | `5` | Number of chunks to retrieve |
+| `RECALL_K` | `20` | Number of chunks to pull from vector search before reranking |
+| `TOP_K` | `3` | Final number of chunks returned to search/RAG after reranking |
+| `GUARDRAILS_ENABLED` | `false` | Enables guardrail checks for user input, retrieval flow, and model output |
+| `CONTENT_SAFETY_ENDPOINT` | empty | Optional Azure AI Content Safety endpoint |
+| `CONTENT_SAFETY_API_KEY` | empty | Optional Azure AI Content Safety API key |
+| `CONTENT_SAFETY_API_VERSION` | `2024-09-01` | Azure AI Content Safety REST API version |
 | `PORT` | `8080` | HTTP server port |
+
+### Guardrails
+
+When `GUARDRAILS_ENABLED=true`, the server can:
+
+- screen user input before retrieval
+- screen retrieval flow/tool-call metadata
+- screen retrieved document excerpts for prompt-injection patterns
+- screen model output before returning it
+
+If `CONTENT_SAFETY_ENDPOINT` and `CONTENT_SAFETY_API_KEY` are set, the app calls Azure AI Content Safety for:
+
+- harmful content thresholds (`Hate`, `SelfHarm`, `Sexual`, `Violence`)
+- Prompt Shields on user prompts
+- Prompt Shields on retrieved document text
+- optional protected-material detection on model output
+
+Without Azure Content Safety configured, the app still applies lightweight local prompt-injection heuristics.
+
+## Evaluation harness
+
+The repo now includes a JSONL evaluation set and a local runner:
+
+```bash
+go run ./cmd/eval
+```
+
+By default it reads `evals/policy_eval_set.jsonl`, runs the current retrieval + generation pipeline, and checks:
+
+- source scoping
+- citation presence
+- forbidden-source leakage
+- guardrail blocking for safety cases (or skips them when guardrails are disabled)
 
 ### Azure AI Foundry / Azure OpenAI
 

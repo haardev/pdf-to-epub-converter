@@ -72,6 +72,7 @@ CREATE EXTENSION IF NOT EXISTS vector;
 
 CREATE TABLE IF NOT EXISTS documents (
     id          SERIAL PRIMARY KEY,
+    document_id TEXT        NOT NULL DEFAULT '',
     source      TEXT        NOT NULL,
     chunk_index INT         NOT NULL,
     page_number INT         NOT NULL DEFAULT 0,
@@ -83,9 +84,12 @@ CREATE TABLE IF NOT EXISTS documents (
     UNIQUE (source, chunk_index)
 );
 
+ALTER TABLE documents ADD COLUMN IF NOT EXISTS document_id TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS page_number INT NOT NULL DEFAULT 0;
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS section_title TEXT NOT NULL DEFAULT '';
 ALTER TABLE documents ADD COLUMN IF NOT EXISTS captions TEXT NOT NULL DEFAULT '';
+UPDATE documents SET document_id = source WHERE document_id = '';
+CREATE INDEX IF NOT EXISTS documents_document_id_idx ON documents (document_id);
 `
 
 func (db *DB) migrate(ctx context.Context) error {

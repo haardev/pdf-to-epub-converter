@@ -40,8 +40,8 @@ func main() {
 		log.Fatalf("ai.New: %v", err)
 	}
 	embedDim := getEnvInt("EMBED_DIM", 0)
-	chunkSize := getEnvInt("CHUNK_SIZE", 90)
-	chunkOverlap := getEnvInt("CHUNK_OVERLAP", 24)
+	chunkSize := getEnvInt("CHUNK_SIZE", 400)
+	chunkOverlap := getEnvInt("CHUNK_OVERLAP", 100)
 
 	ctx := context.Background()
 
