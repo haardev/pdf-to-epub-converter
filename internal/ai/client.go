@@ -3,8 +3,10 @@ package ai
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -223,7 +225,7 @@ func (c *azureClient) Embed(text string) ([]float32, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("api-key", c.apiKey)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithRetry(req)
 	if err != nil {
 		return nil, fmt.Errorf("azure embed request: %w", err)
 	}
@@ -250,10 +252,10 @@ func (c *azureClient) Embed(text string) ([]float32, error) {
 }
 
 type azureChatRequest struct {
-	Model       string               `json:"model,omitempty"`
-	Messages    []azureChatMessage   `json:"messages"`
-	Temperature float64              `json:"temperature,omitempty"`
-	MaxTokens   int                  `json:"max_tokens,omitempty"`
+	Model       string             `json:"model,omitempty"`
+	Messages    []azureChatMessage `json:"messages"`
+	Temperature float64            `json:"temperature,omitempty"`
+	MaxTokens   int                `json:"max_tokens,omitempty"`
 }
 
 type azureChatMessage struct {
@@ -291,7 +293,7 @@ func (c *azureClient) Generate(prompt string) (string, error) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("api-key", c.apiKey)
 
-	resp, err := c.http.Do(req)
+	resp, err := c.doWithRetry(req)
 	if err != nil {
 		return "", fmt.Errorf("azure generate request: %w", err)
 	}
@@ -334,6 +336,75 @@ func (c *azureClient) chatURL() string {
 	return fmt.Sprintf("%s/models/chat/completions?api-version=%s", c.endpoint, url.QueryEscape(c.apiVersion))
 }
 
+func (c *azureClient) doWithRetry(req *http.Request) (*http.Response, error) {
+	const maxAttempts = 3
+
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		cloned := req.Clone(req.Context())
+		if req.GetBody != nil {
+			body, err := req.GetBody()
+			if err != nil {
+				return nil, err
+			}
+			cloned.Body = body
+		}
+
+		resp, err := c.http.Do(cloned)
+		if err == nil {
+			if shouldRetryStatus(resp.StatusCode) && attempt < maxAttempts {
+				_ = resp.Body.Close()
+				time.Sleep(backoffDuration(attempt))
+				continue
+			}
+			return resp, nil
+		}
+
+		lastErr = err
+		if !isTransientAzureError(err) || attempt == maxAttempts {
+			return nil, err
+		}
+		time.Sleep(backoffDuration(attempt))
+	}
+
+	return nil, lastErr
+}
+
+func isTransientAzureError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) {
+		return true
+	}
+
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return netErr.Timeout() || netErr.Temporary()
+	}
+
+	message := strings.ToLower(err.Error())
+	return strings.Contains(message, "eof") ||
+		strings.Contains(message, "connection reset") ||
+		strings.Contains(message, "broken pipe") ||
+		strings.Contains(message, "timeout")
+}
+
+func shouldRetryStatus(status int) bool {
+	return status == http.StatusTooManyRequests || status >= http.StatusInternalServerError
+}
+
+func backoffDuration(attempt int) time.Duration {
+	switch attempt {
+	case 1:
+		return 200 * time.Millisecond
+	case 2:
+		return 500 * time.Millisecond
+	default:
+		return time.Second
+	}
+}
+
 func defaultString(value, fallback string) string {
 	if strings.TrimSpace(value) == "" {
 		return fallback
@@ -344,4 +415,3 @@ func defaultString(value, fallback string) string {
 func isFoundryProjectEndpoint(endpoint string) bool {
 	return strings.Contains(strings.ToLower(endpoint), "/api/projects/")
 }
-
